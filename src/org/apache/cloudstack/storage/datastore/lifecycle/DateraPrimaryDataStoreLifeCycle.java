@@ -20,9 +20,14 @@ package org.apache.cloudstack.storage.datastore.lifecycle;
 
 import com.cloud.agent.api.StoragePoolInfo;
 import com.cloud.capacity.CapacityManager;
+import com.cloud.dc.ClusterVO;
 import com.cloud.dc.DataCenterVO;
 import com.cloud.dc.dao.DataCenterDao;
+import com.cloud.dc.ClusterDetailsDao;
+import com.cloud.dc.dao.ClusterDao;
+import com.cloud.host.Host;
 import com.cloud.host.HostVO;
+import com.cloud.host.dao.HostDao;
 import com.cloud.hypervisor.Hypervisor.HypervisorType;
 import com.cloud.resource.ResourceManager;
 import com.cloud.storage.SnapshotVO;
@@ -30,9 +35,11 @@ import com.cloud.storage.Storage.StoragePoolType;
 import com.cloud.storage.StorageManager;
 import com.cloud.storage.StoragePool;
 import com.cloud.storage.StoragePoolAutomation;
+import com.cloud.storage.StoragePoolHostVO;
 import com.cloud.storage.dao.SnapshotDao;
 import com.cloud.storage.dao.SnapshotDetailsDao;
 import com.cloud.storage.dao.SnapshotDetailsVO;
+import com.cloud.storage.dao.StoragePoolHostDao;
 import com.cloud.utils.exception.CloudRuntimeException;
 import org.apache.cloudstack.engine.subsystem.api.storage.ClusterScope;
 import org.apache.cloudstack.engine.subsystem.api.storage.DataStore;
@@ -40,6 +47,7 @@ import org.apache.cloudstack.engine.subsystem.api.storage.HostScope;
 import org.apache.cloudstack.engine.subsystem.api.storage.PrimaryDataStoreLifeCycle;
 import org.apache.cloudstack.engine.subsystem.api.storage.PrimaryDataStoreParameters;
 import org.apache.cloudstack.engine.subsystem.api.storage.ZoneScope;
+import org.apache.cloudstack.engine.subsystem.api.storage.PrimaryDataStoreInfo;
 import org.apache.cloudstack.storage.datastore.db.PrimaryDataStoreDao;
 import org.apache.cloudstack.storage.datastore.db.StoragePoolVO;
 import org.apache.cloudstack.storage.datastore.util.DateraUtil;
@@ -56,12 +64,16 @@ public class DateraPrimaryDataStoreLifeCycle implements PrimaryDataStoreLifeCycl
 
     @Inject private CapacityManager _capacityMgr;
     @Inject private DataCenterDao zoneDao;
+    @Inject private ClusterDao _clusterDao;
+    @Inject private ClusterDetailsDao _clusterDetailsDao;
     @Inject private PrimaryDataStoreDao storagePoolDao;
+    @Inject private HostDao _hostDao;
     @Inject private PrimaryDataStoreHelper dataStoreHelper;
     @Inject private ResourceManager _resourceMgr;
     @Inject private SnapshotDao _snapshotDao;
     @Inject private SnapshotDetailsDao _snapshotDetailsDao;
     @Inject private StorageManager _storageMgr;
+    @Inject private StoragePoolHostDao _storagePoolHostDao;
     @Inject private StoragePoolAutomation storagePoolAutomation;
 
     @Override
@@ -69,6 +81,8 @@ public class DateraPrimaryDataStoreLifeCycle implements PrimaryDataStoreLifeCycl
 
         String url = (String)dsInfos.get("url");
         Long zoneId = (Long)dsInfos.get("zoneId");
+        Long podId = (Long)dsInfos.get("podId");
+        Long clusterId = (Long)dsInfos.get("clusterId");
         String storagePoolName = (String)dsInfos.get("name");
         String providerName = (String)dsInfos.get("providerName");
         Long capacityBytes = (Long)dsInfos.get("capacityBytes");
@@ -84,11 +98,37 @@ public class DateraPrimaryDataStoreLifeCycle implements PrimaryDataStoreLifeCycl
         String volPlacement = DateraUtil.getVolPlacement(url);
         String clusterAdminUsername = DateraUtil.getValue(DateraUtil.CLUSTER_ADMIN_USERNAME, url);
         String clusterAdminPassword = DateraUtil.getValue(DateraUtil.CLUSTER_ADMIN_PASSWORD, url);
+        String uuid;
 
-        DataCenterVO zone = zoneDao.findById(zoneId);
+        PrimaryDataStoreParameters parameters = new PrimaryDataStoreParameters();
 
-        String uuid = DateraUtil.PROVIDER_NAME + "_" + zone.getUuid() + "_" + storageVip + "_" + clusterAdminUsername + "_" + numReplicas + "_" + volPlacement;
+        // checks if primary datastore is clusterwide. If so, uses the clusterId to set the uuid and then sets the podId and clusterId parameters
+        if (clusterId != null) {
+            if (podId == null) {
+                throw new CloudRuntimeException("The Pod ID must be specified.");
+            }
+            if (zoneId == null) {
+                throw new CloudRuntimeException("The Zone ID must be specified.");
+            }
+            ClusterVO cluster = _clusterDao.findById(clusterId);
+            uuid = DateraUtil.PROVIDER_NAME + "_" + cluster.getUuid() + "_" + storageVip + "_" + clusterAdminUsername + "_" + numReplicas + "_" + volPlacement;
+            s_logger.debug("Setting Datera cluster-wide primary storage uuid to " + uuid);
+            parameters.setPodId(podId);
+            parameters.setClusterId(clusterId);
 
+            HypervisorType hypervisorType = getHypervisorTypeForCluster(clusterId);
+
+            if (!isSupportedHypervisorType(hypervisorType)) {
+                throw new CloudRuntimeException(hypervisorType + " is not a supported hypervisor type.");
+            }
+
+        }
+        // sets the uuid with zoneid in it
+        else {
+            DataCenterVO zone = zoneDao.findById(zoneId);
+            uuid = DateraUtil.PROVIDER_NAME + "_" + zone.getUuid() + "_" + storageVip + "_" + clusterAdminUsername + "_" + numReplicas + "_" + volPlacement;
+            s_logger.debug("Setting Datera zone-wide primary storage uuid to " + uuid);
+        }
         if (capacityBytes == null || capacityBytes <= 0) {
             throw new IllegalArgumentException("'capacityBytes' must be present and greater than 0.");
         }
@@ -96,8 +136,6 @@ public class DateraPrimaryDataStoreLifeCycle implements PrimaryDataStoreLifeCycl
         if (capacityIops == null || capacityIops <= 0) {
             throw new IllegalArgumentException("'capacityIops' must be present and greater than 0.");
         }
-
-        PrimaryDataStoreParameters parameters = new PrimaryDataStoreParameters();
 
         parameters.setHost(storageVip);
         parameters.setPort(storagePort);
@@ -170,11 +208,44 @@ public class DateraPrimaryDataStoreLifeCycle implements PrimaryDataStoreLifeCycl
         return true; // should be ignored for zone-wide-only plug-ins like
     }
 
-    // do not implement this method for
     @Override
-    public boolean attachCluster(DataStore store, ClusterScope scope) {
-        throw new UnsupportedOperationException("Only Zone-wide scope is supported with the Datera Storage driver");
-        //return true; // should be ignored for zone-wide-only plug-ins
+    public boolean attachCluster(DataStore datastore, ClusterScope scope) {
+        PrimaryDataStoreInfo primaryDataStoreInfo = (PrimaryDataStoreInfo)datastore;
+
+        // check if there is at least one host up in this cluster
+        List<HostVO> allHosts = _resourceMgr.listAllUpAndEnabledHosts(Host.Type.Routing, primaryDataStoreInfo.getClusterId(),
+                primaryDataStoreInfo.getPodId(), primaryDataStoreInfo.getDataCenterId());
+
+        if (allHosts.isEmpty()) {
+            storagePoolDao.expunge(primaryDataStoreInfo.getId());
+
+            throw new CloudRuntimeException("No host up to associate a storage pool with in cluster " + primaryDataStoreInfo.getClusterId());
+        }
+
+        List<HostVO> poolHosts = new ArrayList<HostVO>();
+
+        for (HostVO host : allHosts) {
+            try {
+                _storageMgr.connectHostToSharedPool(host.getId(), primaryDataStoreInfo.getId());
+
+                poolHosts.add(host);
+            } catch (Exception e) {
+                s_logger.warn("Unable to establish a connection between " + host + " and " + primaryDataStoreInfo, e);
+            }
+        }
+
+        if (poolHosts.isEmpty()) {
+            s_logger.warn("No host can access storage pool '" + primaryDataStoreInfo + "' on cluster '" + primaryDataStoreInfo.getClusterId() + "'.");
+
+            storagePoolDao.expunge(primaryDataStoreInfo.getId());
+
+            throw new CloudRuntimeException("Failed to access storage pool");
+        }
+
+        dataStoreHelper.attachCluster(datastore);
+
+        return true;
+        //throw new UnsupportedOperationException("Only Zone-wide scope is supported with the Datera Storage driver");
     }
 
     @Override
@@ -218,7 +289,20 @@ public class DateraPrimaryDataStoreLifeCycle implements PrimaryDataStoreLifeCycl
     }
 
     @Override
-    public boolean deleteDataStore(DataStore store) {
+    public boolean deleteDataStore(DataStore dataStore) {
+
+        List<StoragePoolHostVO> hostPoolRecords = _storagePoolHostDao.listByPoolId(dataStore.getId());
+
+        HypervisorType hypervisorType = null;
+
+        if (hostPoolRecords.size() > 0 ) {
+            hypervisorType = getHypervisorType(hostPoolRecords.get(0).getHostId());
+        }
+
+        if (!isSupportedHypervisorType(hypervisorType)) {
+            throw new CloudRuntimeException(hypervisorType + " is not a supported hypervisor type.");
+        }
+
         List<SnapshotVO> lstSnapshots = _snapshotDao.listAll();
 
         if (lstSnapshots != null) {
@@ -226,13 +310,13 @@ public class DateraPrimaryDataStoreLifeCycle implements PrimaryDataStoreLifeCycl
                 SnapshotDetailsVO snapshotDetails = _snapshotDetailsDao.findDetail(snapshot.getId(), DateraUtil.STORAGE_POOL_ID);
 
                 // if this snapshot belongs to the storagePool that was passed in
-                if (snapshotDetails != null && snapshotDetails.getValue() != null && Long.parseLong(snapshotDetails.getValue()) == store.getId()) {
+                if (snapshotDetails != null && snapshotDetails.getValue() != null && Long.parseLong(snapshotDetails.getValue()) == dataStore.getId()) {
                     throw new CloudRuntimeException("This primary storage cannot be deleted because it currently contains one or more snapshots.");
                 }
             }
         }
 
-        return dataStoreHelper.deletePrimaryDataStore(store);
+        return dataStoreHelper.deletePrimaryDataStore(dataStore);
     }
 
     @Override
@@ -275,5 +359,29 @@ public class DateraPrimaryDataStoreLifeCycle implements PrimaryDataStoreLifeCycl
     @Override
     public void disableStoragePool(DataStore dataStore) {
         dataStoreHelper.disable(dataStore);
+    }
+
+    private HypervisorType getHypervisorTypeForCluster(long clusterId) {
+        ClusterVO cluster = _clusterDao.findById(clusterId);
+
+        if (cluster == null) {
+            throw new CloudRuntimeException("Cluster ID '" + clusterId + "' was not found in the database.");
+        }
+
+        return cluster.getHypervisorType();
+    }
+
+    private static boolean isSupportedHypervisorType(HypervisorType hypervisorType) {
+        return HypervisorType.XenServer.equals(hypervisorType) || HypervisorType.VMware.equals(hypervisorType);
+    }
+
+    private HypervisorType getHypervisorType(long hostId) {
+        HostVO host = _hostDao.findById(hostId);
+
+        if (host != null) {
+            return host.getHypervisorType();
+        }
+
+        return HypervisorType.None;
     }
 }
