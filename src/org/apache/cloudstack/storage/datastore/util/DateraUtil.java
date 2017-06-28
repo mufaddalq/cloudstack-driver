@@ -58,7 +58,7 @@ public class DateraUtil {
     private static final String API_VERSION = "v2";
 
     public static final String PROVIDER_NAME = "Datera";
-    public static final String DRIVER_VERSION = "4.7.2-v2.0.1";
+    public static final String DRIVER_VERSION = "4.7.2-v2.0.2";
 
     private static final String HEADER_AUTH_TOKEN = "auth-token";
     private static final String HEADER_CONTENT_TYPE = "Content-type";
